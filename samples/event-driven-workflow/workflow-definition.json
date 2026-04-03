@@ -1,0 +1,214 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "comment": "Illustrative Logic App definition — AIL event-driven decision workflow. Not production-ready. Demonstrates how Logic Apps can implement a human-in-the-loop checkpoint in an AIL workflow triggered by an agent-published event.",
+  "parameters": {
+    "apim_base_url": {
+      "type": "string",
+      "metadata": {
+        "description": "Base URL of the Azure API Management endpoint governing system APIs."
+      }
+    },
+    "approval_email": {
+      "type": "string",
+      "metadata": {
+        "description": "Email address of the human approver for high-value order decisions."
+      }
+    }
+  },
+  "triggers": {
+    "When_an_agent_publishes_order_review_event": {
+      "type": "ApiConnectionWebhook",
+      "inputs": {
+        "host": {
+          "connection": {
+            "name": "@parameters('$connections')['eventgrid']['connectionId']"
+          }
+        },
+        "method": "post",
+        "path": "/subscriptions/@{encodeURIComponent('YOUR_SUBSCRIPTION_ID')}/providers/@{encodeURIComponent('Microsoft.EventGrid.Topics')}/resource/eventSubscriptions",
+        "queries": {
+          "x-ms-api-version": "2017-09-15-preview"
+        },
+        "body": {
+          "properties": {
+            "topic": "/subscriptions/YOUR_SUBSCRIPTION_ID/resourceGroups/YOUR_RG/providers/Microsoft.EventGrid/topics/ail-domain-events",
+            "filter": {
+              "includedEventTypes": ["ail.agent.order.review_required"]
+            }
+          }
+        }
+      }
+    }
+  },
+  "actions": {
+    "Parse_event_data": {
+      "type": "ParseJson",
+      "inputs": {
+        "content": "@triggerBody()?['data']",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "correlation_id": { "type": "string" },
+            "agent_id": { "type": "string" },
+            "order_id": { "type": "string" },
+            "customer_id": { "type": "string" },
+            "order_value": { "type": "number" },
+            "risk_reason": { "type": "string" }
+          }
+        }
+      },
+      "runAfter": {}
+    },
+    "Retrieve_customer_context": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{parameters('apim_base_url')}/v1/customers/@{body('Parse_event_data')?['customer_id']}",
+        "headers": {
+          "X-Correlation-Id": "@{body('Parse_event_data')?['correlation_id']}",
+          "Authorization": "Bearer @{listCallbackUrl()}"
+        }
+      },
+      "runAfter": {
+        "Parse_event_data": ["Succeeded"]
+      }
+    },
+    "Send_approval_request": {
+      "type": "ApiConnectionWebhook",
+      "comment": "Pause execution and await human approval. Logic Apps Consumption and Standard both support approval workflows via Office 365 or Outlook connectors. This action sends an approval email and waits for a response before continuing.",
+      "inputs": {
+        "host": {
+          "connection": {
+            "name": "@parameters('$connections')['office365']['connectionId']"
+          }
+        },
+        "method": "post",
+        "path": "/approvalmail/$subscriptions",
+        "body": {
+          "NotificationUrl": "@listCallbackUrl()",
+          "Message": {
+            "To": "@{parameters('approval_email')}",
+            "Subject": "Agent Decision Review Required — Order @{body('Parse_event_data')?['order_id']}",
+            "HideHTMLMessage": false,
+            "Body": "<p>An AI agent has flagged an order for human review.</p><p><strong>Order ID:</strong> @{body('Parse_event_data')?['order_id']}<br/><strong>Order Value:</strong> $@{body('Parse_event_data')?['order_value']}<br/><strong>Customer:</strong> @{body('Retrieve_customer_context')?['name']}<br/><strong>Risk Reason:</strong> @{body('Parse_event_data')?['risk_reason']}</p><p>Please approve or reject this order.</p>",
+            "Options": "Approve, Reject",
+            "Importance": "High",
+            "ShowHTMLConfirmationDialog": false
+          }
+        }
+      },
+      "runAfter": {
+        "Retrieve_customer_context": ["Succeeded"]
+      }
+    },
+    "Evaluate_approval_response": {
+      "type": "Switch",
+      "expression": "@body('Send_approval_request')?['SelectedOption']",
+      "cases": {
+        "Approved": {
+          "case": "Approve",
+          "actions": {
+            "Release_order_to_fulfillment": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "@{parameters('apim_base_url')}/v1/orders/@{body('Parse_event_data')?['order_id']}/release",
+                "headers": {
+                  "X-Correlation-Id": "@{body('Parse_event_data')?['correlation_id']}",
+                  "Authorization": "Bearer @{listCallbackUrl()}"
+                },
+                "body": {
+                  "approved_by": "@{parameters('approval_email')}",
+                  "approved_at": "@{utcNow()}"
+                }
+              }
+            },
+            "Publish_order_approved_event": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "https://YOUR_EVENT_GRID_TOPIC.eventgrid.azure.net/api/events",
+                "headers": {
+                  "Content-Type": "application/cloudevents-batch+json"
+                },
+                "body": [
+                  {
+                    "id": "@{guid()}",
+                    "source": "/ail/workflow/order-review",
+                    "specversion": "1.0",
+                    "type": "ail.order.approved",
+                    "time": "@{utcNow()}",
+                    "datacontenttype": "application/json",
+                    "data": {
+                      "correlation_id": "@{body('Parse_event_data')?['correlation_id']}",
+                      "order_id": "@{body('Parse_event_data')?['order_id']}",
+                      "approved_by": "@{parameters('approval_email')}"
+                    }
+                  }
+                ]
+              },
+              "runAfter": {
+                "Release_order_to_fulfillment": ["Succeeded"]
+              }
+            }
+          }
+        },
+        "Rejected": {
+          "case": "Reject",
+          "actions": {
+            "Cancel_order": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "@{parameters('apim_base_url')}/v1/orders/@{body('Parse_event_data')?['order_id']}/cancel",
+                "headers": {
+                  "X-Correlation-Id": "@{body('Parse_event_data')?['correlation_id']}",
+                  "Authorization": "Bearer @{listCallbackUrl()}"
+                },
+                "body": {
+                  "cancelled_by": "@{parameters('approval_email')}",
+                  "cancelled_at": "@{utcNow()}",
+                  "reason": "rejected_at_human_review"
+                }
+              }
+            },
+            "Publish_order_rejected_event": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "https://YOUR_EVENT_GRID_TOPIC.eventgrid.azure.net/api/events",
+                "headers": {
+                  "Content-Type": "application/cloudevents-batch+json"
+                },
+                "body": [
+                  {
+                    "id": "@{guid()}",
+                    "source": "/ail/workflow/order-review",
+                    "specversion": "1.0",
+                    "type": "ail.order.rejected",
+                    "time": "@{utcNow()}",
+                    "datacontenttype": "application/json",
+                    "data": {
+                      "correlation_id": "@{body('Parse_event_data')?['correlation_id']}",
+                      "order_id": "@{body('Parse_event_data')?['order_id']}",
+                      "rejected_by": "@{parameters('approval_email')}",
+                      "reason": "rejected_at_human_review"
+                    }
+                  }
+                ]
+              },
+              "runAfter": {
+                "Cancel_order": ["Succeeded"]
+              }
+            }
+          }
+        }
+      },
+      "runAfter": {
+        "Send_approval_request": ["Succeeded"]
+      }
+    }
+  },
+  "outputs": {}
+}
